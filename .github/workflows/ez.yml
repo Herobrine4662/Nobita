@@ -1,0 +1,106 @@
+name: HTNodes
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+  workflow_dispatch:
+
+jobs:
+  HTNodes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340  # 5 hours 40 minutes
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set hostname to HTNodes
+        run: sudo hostnamectl set-hostname HTNodes
+
+      - name: Download VPS backup (if any)
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-backup
+          path: ./backup
+        continue-on-error: true
+
+      - name: Install prerequisites
+        run: |
+          sudo apt update
+          sudo apt install -y curl unzip sudo net-tools neofetch
+
+      - name: Install Tailscale official script
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Restore backup files
+        run: |
+          if [ -f ./backup/backup.zip ]; then
+            unzip -o ./backup/backup.zip -d /opt/vps-backup
+          else
+            echo "No backup found, starting fresh"
+          fi
+
+      - name: Restore Tailscale state
+        run: |
+          if [ -f /opt/vps-backup/data/tailscaled.state ]; then
+            sudo mkdir -p /var/lib/tailscale
+            sudo cp /opt/vps-backup/data/tailscaled.state /var/lib/tailscale/tailscaled.state
+            sudo chmod 600 /var/lib/tailscale/tailscaled.state
+          fi
+
+      - name: Start Tailscale
+        run: |
+          sudo tailscaled &
+          sleep 8
+          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=Nobita || echo "Tailscale already up"
+
+      - name: Create user HTNodes with sudo
+        run: |
+          if ! id -u HTNodes >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash HTNodes
+            echo "HTNodes:HTNodes" | sudo chpasswd
+            sudo usermod -aG sudo HTNodes
+            echo "HTNodes ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/HTNodes
+          fi
+
+      - name: Start SSHX session as HTNodes
+        run: |
+          sudo -u HTNodes -H bash -c '
+            set -x
+            cd /home/HTNodes
+            echo "💻 Connect via Termius/SSH client:"
+
+            echo ""
+            echo "📡 Fetching Tailscale IP..."
+            TS_IP=$(tailscale ip -4 2>/dev/null | head -n 1)
+            if [ -n "$TS_IP" ]; then
+              echo "🔑 Tailscale IP: $TS_IP"
+              echo "👉 Connect with: ssh HTNodes@$TS_IP"
+              echo "👤 Username: HTNodes"
+              echo "🔑 Password: HTNodes"
+            else
+              echo "⚠️ No Tailscale IP found. Maybe Tailscale isn’t fully connected."
+            fi
+
+            echo ""
+            echo "⚡ Starting SSHX session..."
+            curl -sSf https://sshx.io/get | sh -s run
+            which sshx
+            sshx --version
+            timeout 340m sshx -t -o StrictHostKeyChecking=no
+            set +x
+          '
+
+      - name: Backup VPS data
+        run: |
+          sudo mkdir -p /opt/vps-backup/data
+          sudo cp /var/lib/tailscale/tailscaled.state /opt/vps-backup/data/
+          sudo chown -R $USER:$USER /opt/vps-backup
+          zip -r backup.zip /opt/vps-backup
+
+      - name: Upload VPS backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vps-backup
+          path: backup.zip
